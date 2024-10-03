@@ -6,7 +6,7 @@
 
 use std::sync::{atomic::Ordering, Arc};
 
-use common::auth::AccessToken;
+use common::{auth::AccessToken, Server};
 use directory::{
     backend::internal::{
         lookup::DirectoryStore,
@@ -21,12 +21,10 @@ use serde_json::json;
 use trc::AddContext;
 use utils::url_params::UrlParams;
 
-use crate::{
-    api::{http::ToHttpResponse, HttpRequest, HttpResponse, JsonResponse},
-    JMAP,
-};
+use crate::api::{http::ToHttpResponse, HttpRequest, HttpResponse, JsonResponse};
 
 use super::decode_path_element;
+use std::future::Future;
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 #[serde(tag = "type")]
@@ -47,8 +45,32 @@ pub struct AccountAuthResponse {
     pub app_passwords: Vec<String>,
 }
 
-impl JMAP {
-    pub async fn handle_manage_principal(
+pub trait PrincipalManager: Sync + Send {
+    fn handle_manage_principal(
+        &self,
+        req: &HttpRequest,
+        path: Vec<&str>,
+        body: Option<Vec<u8>>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+
+    fn handle_account_auth_get(
+        &self,
+        access_token: Arc<AccessToken>,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+
+    fn handle_account_auth_post(
+        &self,
+        req: &HttpRequest,
+        access_token: Arc<AccessToken>,
+        body: Option<Vec<u8>>,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+
+    fn assert_supported_directory(&self) -> trc::Result<()>;
+}
+
+impl PrincipalManager for Server {
+    async fn handle_manage_principal(
         &self,
         req: &HttpRequest,
         path: Vec<&str>,
@@ -73,6 +95,8 @@ impl JMAP {
                     Type::Domain => Permission::DomainCreate,
                     Type::Tenant => Permission::TenantCreate,
                     Type::Role => Permission::RoleCreate,
+                    Type::ApiKey => Permission::ApiKeyCreate,
+                    Type::OauthClient => Permission::OauthClientCreate,
                     Type::Resource | Type::Location | Type::Other => Permission::PrincipalCreate,
                 })?;
 
@@ -153,6 +177,8 @@ impl JMAP {
                         Type::Tenant,
                         Type::Role,
                         Type::Other,
+                        Type::ApiKey,
+                        Type::OauthClient,
                     ]
                 };
                 for typ in validate_types {
@@ -163,6 +189,8 @@ impl JMAP {
                         Type::Domain => Permission::DomainList,
                         Type::Tenant => Permission::TenantList,
                         Type::Role => Permission::RoleList,
+                        Type::ApiKey => Permission::ApiKeyList,
+                        Type::OauthClient => Permission::OauthClientList,
                         Type::Resource | Type::Location | Type::Other => Permission::PrincipalList,
                     })?;
                 }
@@ -244,6 +272,8 @@ impl JMAP {
                             Type::Domain => Permission::DomainGet,
                             Type::Tenant => Permission::TenantGet,
                             Type::Role => Permission::RoleGet,
+                            Type::ApiKey => Permission::ApiKeyGet,
+                            Type::OauthClient => Permission::OauthClientGet,
                             Type::Resource | Type::Location | Type::Other => {
                                 Permission::PrincipalGet
                             }
@@ -279,6 +309,8 @@ impl JMAP {
                             Type::Domain => Permission::DomainDelete,
                             Type::Tenant => Permission::TenantDelete,
                             Type::Role => Permission::RoleDelete,
+                            Type::ApiKey => Permission::ApiKeyDelete,
+                            Type::OauthClient => Permission::OauthClientDelete,
                             Type::Resource | Type::Location | Type::Other => {
                                 Permission::PrincipalDelete
                             }
@@ -297,13 +329,16 @@ impl JMAP {
                         }
 
                         // Remove entries from cache
-                        self.inner.sessions.retain(|_, id| id.item != account_id);
+                        self.inner
+                            .data
+                            .http_auth_cache
+                            .retain(|_, id| id.item != account_id);
 
                         if matches!(typ, Type::Role | Type::Tenant) {
                             // Update permissions cache
-                            self.core.security.permissions.clear();
-                            self.core
-                                .security
+                            self.inner.data.permissions.clear();
+                            self.inner
+                                .data
                                 .permissions_version
                                 .fetch_add(1, Ordering::Relaxed);
                         }
@@ -322,6 +357,8 @@ impl JMAP {
                             Type::Domain => Permission::DomainUpdate,
                             Type::Tenant => Permission::TenantUpdate,
                             Type::Role => Permission::RoleUpdate,
+                            Type::ApiKey => Permission::ApiKeyUpdate,
+                            Type::OauthClient => Permission::OauthClientUpdate,
                             Type::Resource | Type::Location | Type::Other => {
                                 Permission::PrincipalUpdate
                             }
@@ -357,7 +394,8 @@ impl JMAP {
                                 | PrincipalField::Picture
                                 | PrincipalField::MemberOf
                                 | PrincipalField::Members
-                                | PrincipalField::Lists => (),
+                                | PrincipalField::Lists
+                                | PrincipalField::Urls => (),
                                 PrincipalField::Tenant => {
                                     // Tenants are not allowed to change their tenantId
                                     if access_token.tenant.is_some() {
@@ -399,20 +437,23 @@ impl JMAP {
 
                         if expire_session {
                             // Remove entries from cache
-                            self.inner.sessions.retain(|_, id| id.item != account_id);
+                            self.inner
+                                .data
+                                .http_auth_cache
+                                .retain(|_, id| id.item != account_id);
                         }
 
                         if is_role_change {
                             // Update permissions cache
-                            self.core.security.permissions.clear();
-                            self.core
-                                .security
+                            self.inner.data.permissions.clear();
+                            self.inner
+                                .data
                                 .permissions_version
                                 .fetch_add(1, Ordering::Relaxed);
                         }
 
                         if expire_token {
-                            self.core.security.access_tokens.remove(&account_id);
+                            self.inner.data.access_tokens.remove(&account_id);
                         }
 
                         Ok(JsonResponse::new(json!({
@@ -428,7 +469,7 @@ impl JMAP {
         }
     }
 
-    pub async fn handle_account_auth_get(
+    async fn handle_account_auth_get(
         &self,
         access_token: Arc<AccessToken>,
     ) -> trc::Result<HttpResponse> {
@@ -463,7 +504,7 @@ impl JMAP {
         .into_http_response())
     }
 
-    pub async fn handle_account_auth_post(
+    async fn handle_account_auth_post(
         &self,
         req: &HttpRequest,
         access_token: Arc<AccessToken>,
@@ -513,7 +554,10 @@ impl JMAP {
                         .await?;
 
                     // Remove entries from cache
-                    self.inner.sessions.retain(|_, id| id.item != u32::MAX);
+                    self.inner
+                        .data
+                        .http_auth_cache
+                        .retain(|_, id| id.item != u32::MAX);
 
                     return Ok(JsonResponse::new(json!({
                         "data": (),
@@ -578,7 +622,8 @@ impl JMAP {
 
         // Remove entries from cache
         self.inner
-            .sessions
+            .data
+            .http_auth_cache
             .retain(|_, id| id.item != access_token.primary_id());
 
         Ok(JsonResponse::new(json!({
@@ -587,7 +632,7 @@ impl JMAP {
         .into_http_response())
     }
 
-    pub fn assert_supported_directory(&self) -> trc::Result<()> {
+    fn assert_supported_directory(&self) -> trc::Result<()> {
         let class = match &self.core.storage.directory.store {
             DirectoryInner::Internal(_) => return Ok(()),
             DirectoryInner::Ldap(_) => "LDAP",
@@ -595,6 +640,8 @@ impl JMAP {
             DirectoryInner::Imap(_) => "IMAP",
             DirectoryInner::Smtp(_) => "SMTP",
             DirectoryInner::Memory(_) => "In-Memory",
+            #[cfg(feature = "enterprise")]
+            DirectoryInner::OpenId(_) => "OpenID",
         };
 
         Err(manage::unsupported(format!(

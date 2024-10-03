@@ -3,11 +3,13 @@ use std::{
     collections::HashMap,
     fs,
     path::PathBuf,
+    sync::Arc,
     time::{Duration, Instant},
 };
 
 use ahash::AHashMap;
 use common::{
+    auth::AccessToken,
     scripts::{
         functions::html::{get_attribute, html_attr_tokens, html_img_area, html_to_tokens},
         ScriptModification,
@@ -17,14 +19,14 @@ use common::{
 use mail_auth::{dmarc::Policy, DkimResult, DmarcResult, IprevResult, SpfResult, MX};
 use sieve::runtime::Variable;
 use smtp::{
-    core::{Inner, Session, SessionAddress},
+    core::{Session, SessionAddress},
     inbound::AuthResult,
-    scripts::ScriptResult,
+    scripts::{event_loop::RunScript, ScriptResult},
 };
 use store::Stores;
 use utils::config::Config;
 
-use crate::smtp::{build_smtp, session::TestSession, TempDir};
+use crate::smtp::{session::TestSession, TempDir, TestSMTP};
 
 const CONFIG: &str = r#"
 [spam.header]
@@ -248,7 +250,7 @@ async fn antispam() {
         );
     }
 
-    let core = build_smtp(core, Inner::default());
+    let server = TestSMTP::from_core(core).server;
 
     // Run tests
     let base_path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
@@ -260,7 +262,7 @@ async fn antispam() {
             continue;
         }*/
         println!("===== {test_name} =====");
-        let script = core
+        let script = server
             .core
             .sieve
             .trusted_scripts
@@ -280,7 +282,7 @@ async fn antispam() {
             let mut expected_headers = AHashMap::new();
 
             // Build session
-            let mut session = Session::test(core.clone());
+            let mut session = Session::test(server.clone());
             for line in lines.by_ref() {
                 if in_params {
                     if line.is_empty() {
@@ -298,7 +300,10 @@ async fn antispam() {
                             session.data.helo_domain = value.to_string();
                         }
                         "authenticated_as" => {
-                            session.data.authenticated_as = value.to_string();
+                            session.data.authenticated_as = Some(Arc::new(AccessToken {
+                                name: value.to_string(),
+                                ..Default::default()
+                            }));
                         }
                         "spf.result" | "spf_ehlo.result" => {
                             variables.insert(
@@ -413,9 +418,9 @@ async fn antispam() {
             }
 
             // Run script
-            let core_ = core.clone();
+            let server_ = server.clone();
             let script = script.clone();
-            match core_
+            match server_
                 .run_script("test".to_string(), script, params, 0)
                 .await
             {

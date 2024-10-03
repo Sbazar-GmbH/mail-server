@@ -33,9 +33,10 @@ async fn sql_directory() {
             store: config.stores.lookup_stores.remove(directory_id).unwrap(),
         };
         let base_store = config.stores.stores.get(directory_id).unwrap();
-        let core = config.core;
+        let core = config.server;
 
         // Create tables
+        base_store.destroy().await;
         store.create_test_directory().await;
 
         // Create test users

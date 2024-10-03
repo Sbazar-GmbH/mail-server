@@ -4,12 +4,20 @@
  * SPDX-License-Identifier: AGPL-3.0-only OR LicenseRef-SEL
  */
 
-use common::listener::SessionStream;
-use directory::{backend::internal::PrincipalField, Permission};
+use common::{
+    auth::{
+        sasl::{
+            sasl_decode_challenge_oauth, sasl_decode_challenge_plain, sasl_decode_challenge_xoauth,
+        },
+        AuthRequest,
+    },
+    listener::SessionStream,
+};
+use directory::Permission;
 use mail_parser::decoders::base64::base64_decode;
 use mail_send::Credentials;
 use smtp_proto::{IntoString, AUTH_LOGIN, AUTH_OAUTHBEARER, AUTH_PLAIN, AUTH_XOAUTH2};
-use trc::{AddContext, AuthEvent, SmtpEvent};
+use trc::{AuthEvent, SmtpEvent};
 
 use crate::core::Session;
 
@@ -71,30 +79,9 @@ impl<T: SessionStream> Session<T> {
             }
         } else if let Some(response) = base64_decode(response) {
             match (token.mechanism, &mut token.credentials) {
-                (AUTH_PLAIN, Credentials::Plain { username, secret }) => {
-                    let mut b_username = Vec::new();
-                    let mut b_secret = Vec::new();
-                    let mut arg_num = 0;
-                    for ch in response {
-                        if ch != 0 {
-                            if arg_num == 1 {
-                                b_username.push(ch);
-                            } else if arg_num == 2 {
-                                b_secret.push(ch);
-                            }
-                        } else {
-                            arg_num += 1;
-                        }
-                    }
-                    match (String::from_utf8(b_username), String::from_utf8(b_secret)) {
-                        (Ok(s_username), Ok(s_secret)) if !s_username.is_empty() => {
-                            *username = s_username;
-                            *secret = s_secret;
-                            return self
-                                .authenticate(std::mem::take(&mut token.credentials))
-                                .await;
-                        }
-                        _ => (),
+                (AUTH_PLAIN, _) => {
+                    if let Some(credentials) = sasl_decode_challenge_plain(&response) {
+                        return self.authenticate(credentials).await;
                     }
                 }
                 (AUTH_LOGIN, Credentials::Plain { username, secret }) => {
@@ -108,46 +95,14 @@ impl<T: SessionStream> Session<T> {
                             .await
                     };
                 }
-                (AUTH_OAUTHBEARER, Credentials::OAuthBearer { token: token_ }) => {
-                    let response = response.into_string();
-                    if response.contains("auth=") {
-                        *token_ = response;
-                        return self
-                            .authenticate(std::mem::take(&mut token.credentials))
-                            .await;
+                (AUTH_OAUTHBEARER, _) => {
+                    if let Some(credentials) = sasl_decode_challenge_oauth(&response) {
+                        return self.authenticate(credentials).await;
                     }
                 }
-                (AUTH_XOAUTH2, Credentials::XOauth2 { username, secret }) => {
-                    let mut b_username = Vec::new();
-                    let mut b_secret = Vec::new();
-                    let mut arg_num = 0;
-                    let mut in_arg = false;
-
-                    for ch in response {
-                        if in_arg {
-                            if ch != 1 {
-                                if arg_num == 1 {
-                                    b_username.push(ch);
-                                } else if arg_num == 2 {
-                                    b_secret.push(ch);
-                                }
-                            } else {
-                                in_arg = false;
-                            }
-                        } else if ch == b'=' {
-                            arg_num += 1;
-                            in_arg = true;
-                        }
-                    }
-                    match (String::from_utf8(b_username), String::from_utf8(b_secret)) {
-                        (Ok(s_username), Ok(s_secret)) if !s_username.is_empty() => {
-                            *username = s_username;
-                            *secret = s_secret;
-                            return self
-                                .authenticate(std::mem::take(&mut token.credentials))
-                                .await;
-                        }
-                        _ => (),
+                (AUTH_XOAUTH2, _) => {
+                    if let Some(credentials) = sasl_decode_challenge_xoauth(&response) {
+                        return self.authenticate(credentials).await;
                     }
                 }
 
@@ -160,57 +115,27 @@ impl<T: SessionStream> Session<T> {
 
     pub async fn authenticate(&mut self, credentials: Credentials<String>) -> Result<bool, ()> {
         if let Some(directory) = &self.params.auth_directory {
-            let authenticated_as = match &credentials {
-                Credentials::Plain { username, .. }
-                | Credentials::XOauth2 { username, .. }
-                | Credentials::OAuthBearer { token: username } => username.to_string(),
-            };
-
             // Authenticate
-            let mut result = self
-                .core
-                .core
+            let result = self
+                .server
                 .authenticate(
-                    directory,
-                    self.data.session_id,
-                    &credentials,
-                    self.data.remote_ip,
-                    false,
+                    &AuthRequest::from_credentials(
+                        credentials,
+                        self.data.session_id,
+                        self.data.remote_ip,
+                    )
+                    .with_directory(directory),
                 )
-                .await;
-
-            // Validate permissions
-            if let Ok(principal) = &result {
-                match self
-                    .core
-                    .core
-                    .get_cached_access_token(principal.id())
-                    .await
-                    .caused_by(trc::location!())
-                {
-                    Ok(access_token) => {
-                        if let Err(err) = access_token
-                            .assert_has_permission(Permission::EmailSend)
-                            .and_then(|_| {
-                                access_token.assert_has_permission(Permission::Authenticate)
-                            })
-                        {
-                            result = Err(err);
-                        }
-                    }
-                    Err(err) => {
-                        result = Err(err);
-                    }
-                }
-            }
+                .await
+                .and_then(|access_token| {
+                    access_token
+                        .assert_has_permission(Permission::EmailSend)
+                        .map(|_| access_token)
+                });
 
             match result {
-                Ok(principal) => {
-                    self.data.authenticated_as = authenticated_as.to_lowercase();
-                    self.data.authenticated_emails = principal
-                        .iter_str(PrincipalField::Emails)
-                        .map(|e| e.trim().to_lowercase())
-                        .collect();
+                Ok(access_token) => {
+                    self.data.authenticated_as = access_token.into();
                     self.eval_post_auth_params().await;
                     self.write(b"235 2.7.0 Authentication succeeded.\r\n")
                         .await?;
@@ -227,6 +152,9 @@ impl<T: SessionStream> Session<T> {
                                 .auth_error(b"535 5.7.8 Authentication credentials invalid.\r\n")
                                 .await;
                         }
+                        trc::EventType::Auth(trc::AuthEvent::TokenExpired) => {
+                            return self.auth_error(b"535 5.7.8 OAuth token expired.\r\n").await;
+                        }
                         trc::EventType::Auth(trc::AuthEvent::MissingTotp) => {
                             return self
                             .auth_error(
@@ -235,7 +163,13 @@ impl<T: SessionStream> Session<T> {
                             .await;
                         }
                         trc::EventType::Security(trc::SecurityEvent::Unauthorized) => {
-                            self.write(b"550 5.7.1 Your account is not authorized to use this service.\r\n")
+                            self.write(
+                                concat!(
+                                    "550 5.7.1 Your account is not authorized ",
+                                    "to use this service.\r\n"
+                                )
+                                .as_bytes(),
+                            )
                             .await?;
                             return Ok(false);
                         }
@@ -274,5 +208,27 @@ impl<T: SessionStream> Session<T> {
                 .await?;
             Err(())
         }
+    }
+
+    pub fn authenticated_as(&self) -> Option<&str> {
+        self.data.authenticated_as.as_ref().map(|token| {
+            if !token.name.is_empty() {
+                token.name.as_str()
+            } else {
+                "unavailable"
+            }
+        })
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        self.data.authenticated_as.is_some()
+    }
+
+    pub fn authenticated_emails(&self) -> &[String] {
+        self.data
+            .authenticated_as
+            .as_ref()
+            .map(|token| token.emails.as_slice())
+            .unwrap_or_default()
     }
 }

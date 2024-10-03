@@ -8,15 +8,14 @@ use std::sync::Arc;
 
 use arc_swap::ArcSwap;
 use directory::{Directories, Directory};
+use ring::signature::{EcdsaKeyPair, RsaKeyPair};
 use store::{BlobBackend, BlobStore, FtsStore, LookupStore, Store, Stores};
 use telemetry::Metrics;
-use utils::{
-    config::Config,
-    map::ttl_dashmap::{ADashMap, TtlDashMap, TtlMap},
-};
+use utils::config::Config;
 
 use crate::{
-    expr::*, listener::tls::TlsManager, manager::config::ConfigManager, Core, Network, Security,
+    auth::oauth::config::OAuthConfig, expr::*, listener::tls::AcmeProviders,
+    manager::config::ConfigManager, Core, Network, Security,
 };
 
 use self::{
@@ -25,6 +24,7 @@ use self::{
 };
 
 pub mod imap;
+pub mod inner;
 pub mod jmap;
 pub mod network;
 pub mod scripts;
@@ -62,6 +62,9 @@ impl Core {
             })
             .unwrap_or_default();
 
+        #[cfg(not(feature = "enterprise"))]
+        let is_enterprise = false;
+
         // SPDX-SnippetBegin
         // SPDX-FileCopyrightText: 2020 Stalwart Labs Ltd <hello@stalw.art>
         // SPDX-License-Identifier: LicenseRef-SEL
@@ -69,7 +72,10 @@ impl Core {
         let enterprise = crate::enterprise::Enterprise::parse(config, &stores, &data).await;
 
         #[cfg(feature = "enterprise")]
-        if enterprise.is_none() {
+        let is_enterprise = enterprise.is_some();
+
+        #[cfg(feature = "enterprise")]
+        if is_enterprise {
             if data.is_enterprise_store() {
                 config
                     .new_build_error("storage.data", "SQL read replicas is an Enterprise feature");
@@ -121,7 +127,8 @@ impl Core {
                 }
             })
             .unwrap_or_default();
-        let mut directories = Directories::parse(config, &stores, data.clone()).await;
+        let mut directories =
+            Directories::parse(config, &stores, data.clone(), is_enterprise).await;
         let directory = config
             .value_require("storage.directory")
             .map(|id| id.to_string())
@@ -165,18 +172,9 @@ impl Core {
             smtp: SmtpConfig::parse(config).await,
             jmap: JmapConfig::parse(config),
             imap: ImapConfig::parse(config),
-            tls: TlsManager::parse(config),
+            oauth: OAuthConfig::parse(config),
+            acme: AcmeProviders::parse(config),
             metrics: Metrics::parse(config),
-            security: Security {
-                access_tokens: TtlDashMap::with_capacity(100, 32),
-                permissions: ADashMap::with_capacity_and_hasher_and_shard_amount(
-                    100,
-                    ahash::RandomState::new(),
-                    32,
-                ),
-                permissions_version: Default::default(),
-                logos: Default::default(),
-            },
             storage: Storage {
                 data,
                 blob,
@@ -194,7 +192,40 @@ impl Core {
         }
     }
 
-    pub fn into_shared(self) -> Arc<ArcSwap<Self>> {
-        Arc::new(ArcSwap::from_pointee(self))
+    pub fn into_shared(self) -> ArcSwap<Self> {
+        ArcSwap::from_pointee(self)
+    }
+}
+
+pub fn build_rsa_keypair(pem: &str) -> Result<RsaKeyPair, String> {
+    match rustls_pemfile::read_one(&mut pem.as_bytes()) {
+        Ok(Some(rustls_pemfile::Item::Pkcs1Key(key))) => {
+            RsaKeyPair::from_der(key.secret_pkcs1_der())
+                .map_err(|err| format!("Failed to parse PKCS1 RSA key: {err}"))
+        }
+        Ok(Some(rustls_pemfile::Item::Pkcs8Key(key))) => {
+            RsaKeyPair::from_pkcs8(key.secret_pkcs8_der())
+                .map_err(|err| format!("Failed to parse PKCS8 RSA key: {err}"))
+        }
+        Err(err) => Err(format!("Failed to read PEM: {err}")),
+        Ok(Some(key)) => Err(format!("Unsupported key type: {key:?}")),
+        Ok(None) => Err("No RSA key found in PEM".to_string()),
+    }
+}
+
+pub fn build_ecdsa_pem(
+    alg: &'static ring::signature::EcdsaSigningAlgorithm,
+    pem: &str,
+) -> Result<EcdsaKeyPair, String> {
+    match rustls_pemfile::read_one(&mut pem.as_bytes()) {
+        Ok(Some(rustls_pemfile::Item::Pkcs8Key(key))) => EcdsaKeyPair::from_pkcs8(
+            alg,
+            key.secret_pkcs8_der(),
+            &ring::rand::SystemRandom::new(),
+        )
+        .map_err(|err| format!("Failed to parse PKCS8 ECDSA key: {err}")),
+        Err(err) => Err(format!("Failed to read PEM: {err}")),
+        Ok(Some(key)) => Err(format!("Unsupported key type: {key:?}")),
+        Ok(None) => Err("No ECDSA key found in PEM".to_string()),
     }
 }

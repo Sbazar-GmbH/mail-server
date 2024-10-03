@@ -14,11 +14,12 @@ use std::{
 };
 
 use common::{
-    auth::AccessToken,
+    auth::{oauth::GrantType, AccessToken},
     telemetry::{
         metrics::store::{Metric, MetricsStore},
         tracers::store::{TracingQuery, TracingStore},
     },
+    Server,
 };
 use directory::{backend::internal::manage, Permission};
 use http_body_util::{combinators::BoxBody, StreamBody};
@@ -28,6 +29,7 @@ use hyper::{
 };
 use mail_parser::DateTime;
 use serde_json::json;
+use std::future::Future;
 use store::ahash::{AHashMap, AHashSet};
 use trc::{
     ipc::{bitset::Bitset, subscriber::SubscriberBuilder},
@@ -36,16 +38,22 @@ use trc::{
 };
 use utils::{snowflake::SnowflakeIdGenerator, url_params::UrlParams};
 
-use crate::{
-    api::{
-        http::ToHttpResponse, management::Timestamp, HttpRequest, HttpResponse, HttpResponseBody,
-        JsonResponse,
-    },
-    JMAP,
+use crate::api::{
+    http::ToHttpResponse, management::Timestamp, HttpRequest, HttpResponse, HttpResponseBody,
+    JsonResponse,
 };
 
-impl JMAP {
-    pub async fn handle_telemetry_api_request(
+pub trait TelemetryApi: Sync + Send {
+    fn handle_telemetry_api_request(
+        &self,
+        req: &HttpRequest,
+        path: Vec<&str>,
+        access_token: &AccessToken,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+}
+
+impl TelemetryApi for Server {
+    async fn handle_telemetry_api_request(
         &self,
         req: &HttpRequest,
         path: Vec<&str>,
@@ -347,7 +355,7 @@ impl JMAP {
                 // Issue a live telemetry token valid for 60 seconds
 
                 Ok(JsonResponse::new(json!({
-                    "data": self.issue_custom_token(account_id, "live_tracing", "web", 60).await?,
+                    "data": self.encode_access_token(GrantType::LiveTracing, account_id,  "web", 60).await?,
             }))
             .into_http_response())
             }
@@ -358,7 +366,7 @@ impl JMAP {
                 // Issue a live telemetry token valid for 60 seconds
 
                 Ok(JsonResponse::new(json!({
-                    "data": self.issue_custom_token(account_id, "live_metrics", "web", 60).await?,
+                    "data": self.encode_access_token(GrantType::LiveMetrics, account_id, "web", 60).await?,
             }))
             .into_http_response())
             }
@@ -455,9 +463,9 @@ impl JMAP {
                 ] {
                     if metric_types.contains(&metric_type) {
                         let value = match metric_type {
-                            MetricType::QueueCount => self.core.total_queued_messages().await?,
-                            MetricType::UserCount => self.core.total_accounts().await?,
-                            MetricType::DomainCount => self.core.total_domains().await?,
+                            MetricType::QueueCount => self.total_queued_messages().await?,
+                            MetricType::UserCount => self.total_accounts().await?,
+                            MetricType::DomainCount => self.total_domains().await?,
                             _ => unreachable!(),
                         };
                         Collector::update_gauge(metric_type, value);

@@ -267,26 +267,33 @@ impl MigrateDirectory for Store {
                     account_id: u32::MAX,
                     collection: u8::MAX,
                     document_id: u32::MAX,
-                    class: ValueClass::Directory(DirectoryClass::UsedQuota(0)),
+                    class: ValueClass::Any(AnyClass {
+                        subspace: SUBSPACE_DIRECTORY,
+                        key: vec![4u8],
+                    }),
                 },
             ),
             |key, value| {
-                if key[0] == 2 && value[0] == 1 {
-                    principals.push((
-                        key.get(1..)
-                            .and_then(|b| b.read_leb128::<u32>().map(|(v, _)| v))
-                            .ok_or_else(|| {
-                                trc::StoreEvent::DataCorruption
-                                    .caused_by(trc::location!())
-                                    .ctx(trc::Key::Value, key)
-                            })?,
-                        Principal::deserialize(value)?,
-                    ));
-                } else if key[0] == 3 {
-                    let domain = std::str::from_utf8(&key[1..]).unwrap_or_default();
-                    if !domain.is_empty() {
-                        domains.push(domain.to_string());
+                match (key.first(), value.first()) {
+                    (Some(2), Some(1)) => {
+                        principals.push((
+                            key.get(1..)
+                                .and_then(|b| b.read_leb128::<u32>().map(|(v, _)| v))
+                                .ok_or_else(|| {
+                                    trc::StoreEvent::DataCorruption
+                                        .caused_by(trc::location!())
+                                        .ctx(trc::Key::Value, key)
+                                })?,
+                            Principal::deserialize(value)?,
+                        ));
                     }
+                    (Some(3), _) => {
+                        let domain = std::str::from_utf8(&key[1..]).unwrap_or_default();
+                        if !domain.is_empty() {
+                            domains.push(domain.to_string());
+                        }
+                    }
+                    _ => {}
                 }
 
                 Ok(true)
@@ -401,6 +408,7 @@ pub enum PrincipalField {
     EnabledPermissions,
     DisabledPermissions,
     Picture,
+    Urls,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -479,6 +487,7 @@ impl PrincipalField {
             PrincipalField::DisabledPermissions => 12,
             PrincipalField::UsedQuota => 13,
             PrincipalField::Picture => 14,
+            PrincipalField::Urls => 15,
         }
     }
 
@@ -499,6 +508,7 @@ impl PrincipalField {
             12 => Some(PrincipalField::DisabledPermissions),
             13 => Some(PrincipalField::UsedQuota),
             14 => Some(PrincipalField::Picture),
+            15 => Some(PrincipalField::Urls),
             _ => None,
         }
     }
@@ -520,6 +530,7 @@ impl PrincipalField {
             PrincipalField::EnabledPermissions => "enabledPermissions",
             PrincipalField::DisabledPermissions => "disabledPermissions",
             PrincipalField::Picture => "picture",
+            PrincipalField::Urls => "urls",
         }
     }
 
@@ -540,6 +551,7 @@ impl PrincipalField {
             "enabledPermissions" => Some(PrincipalField::EnabledPermissions),
             "disabledPermissions" => Some(PrincipalField::DisabledPermissions),
             "picture" => Some(PrincipalField::Picture),
+            "urls" => Some(PrincipalField::Urls),
             _ => None,
         }
     }

@@ -225,11 +225,11 @@ impl EventType {
             },
             EventType::Manage(_) => Level::Debug,
             EventType::Auth(cause) => match cause {
-                AuthEvent::Failed => Level::Debug,
+                AuthEvent::Failed | AuthEvent::TokenExpired => Level::Debug,
                 AuthEvent::MissingTotp => Level::Trace,
                 AuthEvent::TooManyAttempts => Level::Warn,
                 AuthEvent::Error => Level::Error,
-                AuthEvent::Success => Level::Info,
+                AuthEvent::Success | AuthEvent::ClientRegistration => Level::Info,
             },
             EventType::Config(cause) => match cause {
                 ConfigEvent::ParseError

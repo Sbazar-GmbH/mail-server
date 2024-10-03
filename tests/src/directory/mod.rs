@@ -7,10 +7,11 @@
 pub mod imap;
 pub mod internal;
 pub mod ldap;
+pub mod oidc;
 pub mod smtp;
 pub mod sql;
 
-use common::{config::smtp::session::AddressMapping, Core};
+use common::{config::smtp::session::AddressMapping, Core, Server};
 use directory::{
     backend::internal::{manage::ManageDirectory, PrincipalField},
     Directories, Principal, Type,
@@ -244,6 +245,65 @@ name = "support"
 class = "group"
 description = "Support Team"
 
+##############################################################################
+
+[directory."oidc-userinfo"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/userinfo"
+endpoint.method = "userinfo"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-none"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-none"
+endpoint.method = "introspect"
+auth.method = "none"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-user-token"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-user-token"
+endpoint.method = "introspect"
+auth.method = "user-token"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-token"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-token"
+endpoint.method = "introspect"
+auth.method = "token"
+auth.token = "token_of_gratitude"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
+[directory."oidc-introspect-basic"]
+type = "oidc"
+store = "rocksdb"
+timeout = "1s"
+endpoint.url = "https://127.0.0.1:9090/introspect-basic"
+endpoint.method = "introspect"
+auth.method = "basic"
+auth.username = "myuser"
+auth.secret = "mypass"
+fields.email = "email"
+fields.username = "preferred_username"
+fields.full-name = "name"
+
 "#;
 
 pub struct DirectoryStore {
@@ -254,7 +314,7 @@ pub struct DirectoryTest {
     pub directories: Directories,
     pub stores: Stores,
     pub temp_dir: TempDir,
-    pub core: Core,
+    pub server: Server,
 }
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -267,6 +327,7 @@ pub struct TestPrincipal {
     pub emails: Vec<String>,
     pub member_of: Vec<String>,
     pub roles: Vec<String>,
+    pub lists: Vec<String>,
     pub description: Option<String>,
 }
 
@@ -298,6 +359,7 @@ impl DirectoryTest {
             id_store
                 .map(|id| stores.stores.get(id).unwrap().clone())
                 .unwrap_or_default(),
+            true,
         )
         .await;
         config.assert_no_errors();
@@ -311,7 +373,10 @@ impl DirectoryTest {
             directories,
             stores,
             temp_dir,
-            core,
+            server: Server {
+                inner: Default::default(),
+                core: core.into(),
+            },
         }
     }
 }
@@ -461,6 +526,9 @@ impl From<Principal> for TestPrincipal {
             roles: value
                 .take_str_array(PrincipalField::Roles)
                 .unwrap_or_default(),
+            lists: value
+                .take_str_array(PrincipalField::Lists)
+                .unwrap_or_default(),
             description: value.take_str(PrincipalField::Description),
         }
     }
@@ -474,6 +542,7 @@ impl From<TestPrincipal> for Principal {
             .with_field(PrincipalField::Secrets, value.secrets)
             .with_field(PrincipalField::Emails, value.emails)
             .with_field(PrincipalField::MemberOf, value.member_of)
+            .with_field(PrincipalField::Lists, value.lists)
             .with_opt_field(PrincipalField::Description, value.description)
     }
 }
@@ -598,7 +667,7 @@ async fn address_mappings() {
     let mut config = utils::config::Config::new(MAPPINGS).unwrap();
     const ADDR: &str = "john.doe+alias@example.org";
     const ADDR_NO_MATCH: &str = "jane@example.org";
-    let core = Core::default();
+    let core = Server::default();
 
     for test in ["enable", "disable", "custom"] {
         let catch_all = AddressMapping::parse(&mut config, (test, "catch-all"));

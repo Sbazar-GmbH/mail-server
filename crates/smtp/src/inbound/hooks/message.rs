@@ -36,7 +36,7 @@ impl<T: SessionStream> Session<T> {
         message: Option<&AuthenticatedMessage<'_>>,
         queue_id: Option<QueueId>,
     ) -> Result<Vec<Modification>, FilterResponse> {
-        let mta_hooks = &self.core.core.smtp.session.hooks;
+        let mta_hooks = &self.server.core.smtp.session.hooks;
         if mta_hooks.is_empty() {
             return Ok(Vec::new());
         }
@@ -45,8 +45,7 @@ impl<T: SessionStream> Session<T> {
         for mta_hook in mta_hooks {
             if !mta_hook.run_on_stage.contains(&stage)
                 || !self
-                    .core
-                    .core
+                    .server
                     .eval_if(&mta_hook.enable, self, self.data.session_id)
                     .await
                     .unwrap_or(false)
@@ -197,8 +196,8 @@ impl<T: SessionStream> Session<T> {
                         .then(|| self.data.helo_domain.clone()),
                     active_connections: 1,
                 },
-                sasl: (!self.data.authenticated_as.is_empty()).then(|| Sasl {
-                    login: self.data.authenticated_as.clone(),
+                sasl: self.authenticated_as().map(|name| Sasl {
+                    login: name.to_string(),
                     method: None,
                 }),
                 tls: (!tls_version.is_empty()).then(|| Tls {

@@ -13,7 +13,7 @@ use smtp_proto::*;
 
 use crate::{core::Session, inbound::AuthResult};
 
-use super::{ScriptParameters, ScriptResult};
+use super::{event_loop::RunScript, ScriptParameters, ScriptResult};
 
 impl<T: SessionStream> Session<T> {
     pub fn build_script_parameters(&self, stage: &'static str) -> ScriptParameters<'_> {
@@ -22,7 +22,10 @@ impl<T: SessionStream> Session<T> {
             .set_variable("remote_ip", self.data.remote_ip.to_string())
             .set_variable("remote_ip.reverse", self.data.remote_ip.to_reverse_name())
             .set_variable("helo_domain", self.data.helo_domain.to_lowercase())
-            .set_variable("authenticated_as", self.data.authenticated_as.clone())
+            .set_variable(
+                "authenticated_as",
+                self.authenticated_as().unwrap_or_default().to_string(),
+            )
             .set_variable(
                 "now",
                 SystemTime::now()
@@ -124,12 +127,12 @@ impl<T: SessionStream> Session<T> {
         script: Arc<Sieve>,
         params: ScriptParameters<'_>,
     ) -> ScriptResult {
-        self.core
+        self.server
             .run_script(
                 script_id,
                 script,
                 params
-                    .with_envelope(&self.core.core, self, self.data.session_id)
+                    .with_envelope(&self.server, self, self.data.session_id)
                     .await,
                 self.data.session_id,
             )

@@ -923,8 +923,10 @@ pub enum ManageEvent {
 pub enum AuthEvent {
     Success,
     Failed,
+    TokenExpired,
     MissingTotp,
     TooManyAttempts,
+    ClientRegistration,
     Error,
 }
 

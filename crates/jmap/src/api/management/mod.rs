@@ -19,15 +19,31 @@ pub mod stores;
 
 use std::{borrow::Cow, str::FromStr, sync::Arc};
 
-use common::auth::AccessToken;
+use common::{auth::AccessToken, Server};
 use directory::{backend::internal::manage, Permission};
+use dkim::DkimManagement;
+use dns::DnsManagement;
+use enterprise::telemetry::TelemetryApi;
 use hyper::Method;
+use log::LogManagement;
 use mail_parser::DateTime;
+use principal::PrincipalManager;
+use queue::QueueManagement;
+use reload::ManageReload;
+use report::ManageReports;
 use serde::Serialize;
+use settings::ManageSettings;
+use sieve::SieveHandler;
 use store::write::now;
+use stores::ManageStore;
 
-use super::{http::HttpSessionData, HttpRequest, HttpResponse};
-use crate::JMAP;
+use crate::{auth::oauth::auth::OAuthApiHandler, email::crypto::CryptoHandler};
+
+use super::{
+    http::{fetch_body, HttpSessionData},
+    HttpRequest, HttpResponse,
+};
+use std::future::Future;
 
 #[derive(Serialize)]
 #[serde(tag = "error")]
@@ -53,15 +69,24 @@ pub enum ManagementApiError<'x> {
     },
 }
 
-impl JMAP {
-    #[allow(unused_variables)]
-    pub async fn handle_api_manage_request(
+pub trait ManagementApi: Sync + Send {
+    fn handle_api_manage_request(
         &self,
-        req: &HttpRequest,
-        body: Option<Vec<u8>>,
+        req: &mut HttpRequest,
+        access_token: Arc<AccessToken>,
+        session: &HttpSessionData,
+    ) -> impl Future<Output = trc::Result<HttpResponse>> + Send;
+}
+
+impl ManagementApi for Server {
+    #[allow(unused_variables)]
+    async fn handle_api_manage_request(
+        &self,
+        req: &mut HttpRequest,
         access_token: Arc<AccessToken>,
         session: &HttpSessionData,
     ) -> trc::Result<HttpResponse> {
+        let body = fetch_body(req, 1024 * 1024, session.session_id).await;
         let path = req.uri().path().split('/').skip(2).collect::<Vec<_>>();
 
         match path.first().copied().unwrap_or_default() {
